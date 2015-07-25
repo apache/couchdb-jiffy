@@ -1,6 +1,5 @@
 language: erlang
-notifications:
-  email: paul.joseph.davis@gmail.com
+
 otp_release:
    - 17.5
    - 17.4
