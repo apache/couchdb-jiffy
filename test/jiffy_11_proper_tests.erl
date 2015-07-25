@@ -1,24 +1,36 @@
 % This file is part of Jiffy released under the MIT license.
 % See the LICENSE file for more information.
 
--module(jiffy_tests).
+-module(jiffy_11_proper_tests).
 
 -ifdef(JIFFY_DEV).
 
 -include_lib("proper/include/proper.hrl").
 -include_lib("eunit/include/eunit.hrl").
+-include("jiffy_util.hrl").
 
-
-proper_test_() ->
-    PropErOpts = [
-        {to_file, user},
+opts() ->
+    [
         {max_size, 15},
         {numtests, 1000}
-    ],
-    {timeout, 3600, ?_assertEqual([], proper:module(jiffy_tests, PropErOpts))}.
+    ].
 
+run(Name) ->
+    {msg("~s", [Name]), [
+        {timeout, 300, ?_assert(proper:quickcheck(?MODULE:Name(), opts()))}
+    ]}.
 
-prop_encode_decode() ->
+proper_encode_decode_test_() ->
+    [
+        run(prop_enc_dec),
+        run(prop_enc_dec_pretty),
+        run(prop_dec_trailer),
+        run(prop_enc_no_crash),
+        run(prop_dec_no_crash_bin),
+        run(prop_dec_no_crash_any)
+    ].
+
+prop_enc_dec() ->
     ?FORALL(Data, json(),
         begin
             %io:format(standard_error, "Data: ~p~n", [Data]),
@@ -26,20 +38,58 @@ prop_encode_decode() ->
         end
     ).
 
-prop_encode_decode_pretty() ->
+prop_dec_trailer() ->
+    ?FORALL({T1, T2}, {json(), json()},
+        begin
+            B1 = jiffy:encode(T1),
+            B2 = jiffy:encode(T2),
+            Combiners = [
+                <<" ">>,
+                <<"\r\t">>,
+                <<"\n   \t">>,
+                <<"                     ">>
+            ],
+            lists:foreach(fun(Comb) ->
+                Bin = <<B1/binary, Comb/binary, B2/binary>>,
+                {has_trailer, T1, Rest} = jiffy:decode(Bin, [return_trailer]),
+                T2 = jiffy:decode(Rest)
+            end, Combiners),
+            true
+        end
+    ).
+
+-ifndef(JIFFY_NO_MAPS).
+to_map_ejson({Props}) ->
+    NewProps = [{K, to_map_ejson(V)} || {K, V} <- Props],
+    maps:from_list(NewProps);
+to_map_ejson(Vals) when is_list(Vals) ->
+    [to_map_ejson(V) || V <- Vals];
+to_map_ejson(Val) ->
+    Val.
+
+prop_map_enc_dec() ->
+    ?FORALL(Data, json(),
+        begin
+            MapData = to_map_ejson(Data),
+            MapData == jiffy:decode(jiffy:encode(MapData), [return_maps])
+        end
+    ).
+-endif.
+
+prop_enc_dec_pretty() ->
     ?FORALL(Data, json(),
         begin
             Data == jiffy:decode(jiffy:encode(Data, [pretty]))
         end
     ).
 
-prop_encode_not_crash() ->
+prop_enc_no_crash() ->
     ?FORALL(Data, any(), begin catch jiffy:encode(Data), true end).
 
-prop_decode_not_crash_bin() ->
+prop_dec_no_crash_bin() ->
     ?FORALL(Data, binary(), begin catch jiffy:decode(Data), true end).
 
-prop_decode_not_crash_any() ->
+prop_dec_no_crash_any() ->
     ?FORALL(Data, any(), begin catch jiffy:decode(Data), true end).
 
 
