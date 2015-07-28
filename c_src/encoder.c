@@ -28,14 +28,21 @@ do {                                \
 typedef struct {
     ErlNifEnv*      env;
     jiffy_st*       atoms;
+
+    size_t          bytes_per_red;
+
     int             uescape;
     int             pretty;
+    int             use_nil;
+    int             escape_forward_slashes;
 
     int             shiftcnt;
     int             count;
 
-    int             iolen;
+    size_t          iolen;
+    size_t          iosize;
     ERL_NIF_TERM    iolist;
+    ErlNifBinary    bin;
     ErlNifBinary*   curr;
 
 
@@ -60,39 +67,28 @@ static char* shifts[NUM_SHIFTS] = {
 };
 
 
-int
-enc_init(Encoder* e, ErlNifEnv* env, ERL_NIF_TERM opts, ErlNifBinary* bin)
+Encoder*
+enc_new(ErlNifEnv* env)
 {
-    ERL_NIF_TERM val;
+    jiffy_st* st = (jiffy_st*) enif_priv_data(env);
+    Encoder* e = enif_alloc_resource(st->res_enc, sizeof(Encoder));
 
-    e->env = env;
-    e->atoms = enif_priv_data(env);
+    e->atoms = st;
+    e->bytes_per_red = DEFAULT_BYTES_PER_REDUCTION;
     e->uescape = 0;
     e->pretty = 0;
+    e->use_nil = 0;
+    e->escape_forward_slashes = 0;
     e->shiftcnt = 0;
     e->count = 0;
 
-    if(!enif_is_list(env, opts)) {
-        return 0;
-    }
-
-    while(enif_get_list_cell(env, opts, &val, &opts)) {
-        if(enif_compare(val, e->atoms->atom_uescape) == 0) {
-            e->uescape = 1;
-        } else if(enif_compare(val, e->atoms->atom_pretty) == 0) {
-            e->pretty = 1;
-        } else if(enif_compare(val, e->atoms->atom_force_utf8) == 0) {
-            // Ignore, handled in Erlang
-        } else {
-            return 0;
-        }
-    }
-
     e->iolen = 0;
-    e->iolist = enif_make_list(env, 0);
-    e->curr = bin;
+    e->iosize = 0;
+    e->curr = &(e->bin);
     if(!enif_alloc_binary(BIN_INC_SIZE, e->curr)) {
-        return 0;
+        e->curr = NULL;
+        enif_release_resource(e);
+        return NULL;
     }
 
     memset(e->curr->data, 0, e->curr->size);
@@ -101,12 +97,21 @@ enc_init(Encoder* e, ErlNifEnv* env, ERL_NIF_TERM opts, ErlNifBinary* bin)
     e->u = (unsigned char*) e->curr->data;
     e->i = 0;
 
+    return e;
+}
+
+int
+enc_init(Encoder* e, ErlNifEnv* env)
+{
+    e->env = env;
     return 1;
 }
 
 void
-enc_destroy(Encoder* e)
+enc_destroy(ErlNifEnv* env, void* obj)
 {
+    Encoder* e = (Encoder*) obj;
+
     if(e->curr != NULL) {
         enif_release_binary(e->curr);
     }
@@ -117,6 +122,12 @@ enc_error(Encoder* e, const char* msg)
 {
     //assert(0 && msg);
     return make_error(e->atoms, e->env, msg);
+}
+
+ERL_NIF_TERM
+enc_obj_error(Encoder* e, const char* msg, ERL_NIF_TERM obj)
+{
+    return make_obj_error(e->atoms, e->env, msg, obj);
 }
 
 static inline int
@@ -190,17 +201,28 @@ enc_unknown(Encoder* e, ERL_NIF_TERM value)
     e->iolist = enif_make_list_cell(e->env, value, e->iolist);
     e->iolen++;
 
-    // Reinitialize our binary for the next buffer.
-    e->curr = bin;
-    if(!enif_alloc_binary(BIN_INC_SIZE, e->curr)) {
-        return 0;
+    // Track the total number of bytes produced before
+    // splitting our IO buffer. We add 16 to this value
+    // as a rough estimate of the number of bytes that
+    // a bignum might produce when encoded.
+    e->iosize += e->i + 16;
+
+    // Reinitialize our binary for the next buffer if we
+    // used any data in the buffer. If we haven't used any
+    // bytes in the buffer then we can safely reuse it
+    // for anything following the unknown value.
+    if(e->i > 0) {
+        e->curr = bin;
+        if(!enif_alloc_binary(BIN_INC_SIZE, e->curr)) {
+            return 0;
+        }
+
+        memset(e->curr->data, 0, e->curr->size);
+
+        e->p = (char*) e->curr->data;
+        e->u = (unsigned char*) e->curr->data;
+        e->i = 0;
     }
-
-    memset(e->curr->data, 0, e->curr->size);
-
-    e->p = (char*) e->curr->data;
-    e->u = (unsigned char*) e->curr->data;
-    e->i = 0;
 
     return 1;
 }
@@ -261,6 +283,12 @@ enc_string(Encoder* e, ERL_NIF_TERM val)
                 esc_extra += 1;
                 i++;
                 continue;
+            case '/':
+                if(e->escape_forward_slashes) {
+                    esc_extra += 1;
+                    i++;
+                    continue;
+                }
             default:
                 if(data[i] < 0x20) {
                     esc_extra += 5;
@@ -328,6 +356,13 @@ enc_string(Encoder* e, ERL_NIF_TERM val)
                 e->p[e->i++] = 't';
                 i++;
                 continue;
+            case '/':
+                if(e->escape_forward_slashes) {
+                    e->p[e->i++] = '\\';
+                    e->u[e->i++] = data[i];
+                    i++;
+                    continue;
+                }
             default:
                 if(data[i] < 0x20) {
                     ulen = unicode_uescape(data[i], &(e->p[e->i]));
@@ -493,14 +528,109 @@ enc_comma(Encoder* e)
     return 1;
 }
 
-ERL_NIF_TERM
-encode(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+#if MAP_TYPE_PRESENT
+int
+enc_map_to_ejson(ErlNifEnv* env, ERL_NIF_TERM map, ERL_NIF_TERM* out)
 {
-    Encoder enc;
-    Encoder* e = &enc;
+    ErlNifMapIterator iter;
+    size_t size;
 
-    ErlNifBinary bin;
-    ERL_NIF_TERM ret;
+    ERL_NIF_TERM list;
+    ERL_NIF_TERM tuple;
+    ERL_NIF_TERM key;
+    ERL_NIF_TERM val;
+
+    if(!enif_get_map_size(env, map, &size)) {
+        fprintf(stderr, "bad map size\r\n");
+        return 0;
+    }
+
+    list = enif_make_list(env, 0);
+
+    if(size == 0) {
+        *out = enif_make_tuple1(env, list);
+        return 1;
+    }
+
+    if(!enif_map_iterator_create(env, map, &iter, ERL_NIF_MAP_ITERATOR_HEAD)) {
+        fprintf(stderr, "bad iterator create\r\n");
+        return 0;
+    }
+
+    do {
+        if(!enif_map_iterator_get_pair(env, &iter, &key, &val)) {
+            fprintf(stderr, "bad get pair\r\n");
+            return 0;
+        }
+        tuple = enif_make_tuple2(env, key, val);
+        list = enif_make_list_cell(env, tuple, list);
+    } while(enif_map_iterator_next(env, &iter));
+
+    *out = enif_make_tuple1(env, list);
+    return 1;
+}
+#endif
+
+ERL_NIF_TERM
+encode_init(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+    jiffy_st* st = (jiffy_st*) enif_priv_data(env);
+    Encoder* e;
+
+    ERL_NIF_TERM opts;
+    ERL_NIF_TERM val;
+    ERL_NIF_TERM tmp_argv[3];
+
+    if(argc != 2) {
+        return enif_make_badarg(env);
+    }
+
+    e = enc_new(env);
+    if(e == NULL) {
+        return make_error(st, env, "internal_error");
+    }
+
+    tmp_argv[0] = enif_make_resource(env, e);
+    tmp_argv[1] = enif_make_list(env, 1, argv[0]);
+    tmp_argv[2] = enif_make_list(env, 0);
+
+    enif_release_resource(e);
+
+    opts = argv[1];
+    if(!enif_is_list(env, opts)) {
+        return enif_make_badarg(env);
+    }
+
+    while(enif_get_list_cell(env, opts, &val, &opts)) {
+        if(enif_compare(val, e->atoms->atom_uescape) == 0) {
+            e->uescape = 1;
+        } else if(enif_compare(val, e->atoms->atom_pretty) == 0) {
+            e->pretty = 1;
+        } else if(enif_compare(val, e->atoms->atom_escape_forward_slashes) == 0) {
+            e->escape_forward_slashes = 1;
+        } else if(enif_compare(val, e->atoms->atom_use_nil) == 0) {
+            e->use_nil = 1;
+        } else if(enif_compare(val, e->atoms->atom_force_utf8) == 0) {
+            // Ignore, handled in Erlang
+        } else if(get_bytes_per_iter(env, val, &(e->bytes_per_red))) {
+            continue;
+        } else if(get_bytes_per_red(env, val, &(e->bytes_per_red))) {
+            continue;
+        } else {
+            return enif_make_badarg(env);
+        }
+    }
+
+    return encode_iter(env, 3, tmp_argv);
+}
+
+ERL_NIF_TERM
+encode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+    Encoder* e;
+    jiffy_st* st = (jiffy_st*) enif_priv_data(env);
+
+    ERL_NIF_TERM ret = 0;
 
     ERL_NIF_TERM stack;
     ERL_NIF_TERM curr;
@@ -510,17 +640,42 @@ encode(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     ErlNifSInt64 lval;
     double dval;
 
-    if(argc != 2) {
+    size_t start;
+    size_t bytes_written = 0;
+
+    if(argc != 3) {
+        return enif_make_badarg(env);
+    } else if(!enif_get_resource(env, argv[0], st->res_enc, (void**) &e)) {
+        return enif_make_badarg(env);
+    } else if(!enif_is_list(env, argv[1])) {
+        return enif_make_badarg(env);
+    } else if(!enif_is_list(env, argv[2])) {
         return enif_make_badarg(env);
     }
 
-    if(!enc_init(e, env, argv[1], &bin)) {
+    if(!enc_init(e, env)) {
         return enif_make_badarg(env);
     }
 
-    stack = enif_make_list(env, 1, argv[0]);
+    stack = argv[1];
+    e->iolist = argv[2];
+
+    start = e->iosize + e->i;
 
     while(!enif_is_empty_list(env, stack)) {
+
+        bytes_written += (e->iosize + e->i) - start;
+
+        if(should_yield(env, &bytes_written, e->bytes_per_red)) {
+            return enif_make_tuple4(
+                    env,
+                    st->atom_iter,
+                    argv[0],
+                    stack,
+                    e->iolist
+                );
+        }
+
         if(!enif_get_list_cell(env, stack, &curr, &stack)) {
             ret = enc_error(e, "internal_error");
             goto done;
@@ -542,11 +697,11 @@ encode(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                 goto done;
             }
             if(!enif_get_tuple(env, item, &arity, &tuple)) {
-                ret = enc_error(e, "invalid_object_pair");
+                ret = enc_obj_error(e, "invalid_object_member", item);
                 goto done;
             }
             if(arity != 2) {
-                ret = enc_error(e, "invalid_object_pair");
+                ret = enc_obj_error(e, "invalid_object_member_arity", item);
                 goto done;
             }
             if(!enc_comma(e)) {
@@ -554,7 +709,7 @@ encode(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                 goto done;
             }
             if(!enc_string(e, tuple[0])) {
-                ret = enc_error(e, "invalid_object_key");
+                ret = enc_obj_error(e, "invalid_object_member_key", tuple[0]);
                 goto done;
             }
             if(!enc_colon(e)) {
@@ -592,6 +747,11 @@ encode(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                 ret = enc_error(e, "null");
                 goto done;
             }
+        } else if(e->use_nil && enif_compare(curr, e->atoms->atom_nil) == 0) {
+            if(!enc_literal(e, "null", 4)) {
+                ret = enc_error(e, "null");
+                goto done;
+            }
         } else if(enif_compare(curr, e->atoms->atom_true) == 0) {
             if(!enc_literal(e, "true", 4)) {
                 ret = enc_error(e, "true");
@@ -604,12 +764,12 @@ encode(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
             }
         } else if(enif_is_binary(env, curr)) {
             if(!enc_string(e, curr)) {
-                ret = enc_error(e, "invalid_string");
+                ret = enc_obj_error(e, "invalid_string", curr);
                 goto done;
             }
         } else if(enif_is_atom(env, curr)) {
             if(!enc_string(e, curr)) {
-                ret = enc_error(e, "invalid_string");
+                ret = enc_obj_error(e, "invalid_string", curr);
                 goto done;
             }
         } else if(enif_get_int64(env, curr, &lval)) {
@@ -624,11 +784,11 @@ encode(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
             }
         } else if(enif_get_tuple(env, curr, &arity, &tuple)) {
             if(arity != 1) {
-                ret = enc_error(e, "invalid_ejson");
+                ret = enc_obj_error(e, "invalid_ejson", curr);
                 goto done;
             }
             if(!enif_is_list(env, tuple[0])) {
-                ret = enc_error(e, "invalid_object");
+                ret = enc_obj_error(e, "invalid_object", curr);
                 goto done;
             }
             if(!enc_start_object(e)) {
@@ -647,15 +807,15 @@ encode(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                 goto done;
             }
             if(!enif_get_tuple(env, item, &arity, &tuple)) {
-                ret = enc_error(e, "invalid_object_member");
+                ret = enc_obj_error(e, "invalid_object_member", item);
                 goto done;
             }
             if(arity != 2) {
-                ret = enc_error(e, "invalid_object_member_arity");
+                ret = enc_obj_error(e, "invalid_object_member_arity", item);
                 goto done;
             }
             if(!enc_string(e, tuple[0])) {
-                ret = enc_error(e, "invalid_object_member_key");
+                ret = enc_obj_error(e, "invalid_object_member_key", tuple[0]);
                 goto done;
             }
             if(!enc_colon(e)) {
@@ -665,6 +825,14 @@ encode(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
             stack = enif_make_list_cell(env, curr, stack);
             stack = enif_make_list_cell(env, e->atoms->ref_object, stack);
             stack = enif_make_list_cell(env, tuple[1], stack);
+#if MAP_TYPE_PRESENT
+        } else if(enif_is_map(env, curr)) {
+            if(!enc_map_to_ejson(env, curr, &curr)) {
+                ret = enc_error(e, "internal_error");
+                goto done;
+            }
+            stack = enif_make_list_cell(env, curr, stack);
+#endif
         } else if(enif_is_list(env, curr)) {
             if(!enc_start_array(e)) {
                 ret = enc_error(e, "internal_error");
@@ -704,6 +872,6 @@ encode(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     }
 
 done:
-    enc_destroy(e);
+
     return ret;
 }

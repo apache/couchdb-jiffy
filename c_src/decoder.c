@@ -49,7 +49,11 @@ typedef struct {
     ERL_NIF_TERM    arg;
     ErlNifBinary    bin;
 
+    size_t          bytes_per_red;
     int             is_partial;
+    int             return_maps;
+    int             return_trailer;
+    ERL_NIF_TERM    null_term;
 
     char*           p;
     unsigned char*  u;
@@ -61,21 +65,29 @@ typedef struct {
     int             st_top;
 } Decoder;
 
-void
-dec_init(Decoder* d, ErlNifEnv* env, ERL_NIF_TERM arg, ErlNifBinary* bin)
+Decoder*
+dec_new(ErlNifEnv* env)
 {
+    jiffy_st* st = (jiffy_st*) enif_priv_data(env);
+    Decoder* d = enif_alloc_resource(st->res_dec, sizeof(Decoder));
     int i;
 
-    d->env = env;
-    d->atoms = enif_priv_data(env);
-    d->arg = arg;
+    if(d == NULL) {
+        return NULL;
+    }
 
+    d->atoms = st;
+
+    d->bytes_per_red = DEFAULT_BYTES_PER_REDUCTION;
     d->is_partial = 0;
+    d->return_maps = 0;
+    d->return_trailer = 0;
+    d->null_term = d->atoms->atom_null;
 
-    d->p = (char*) bin->data;
-    d->u = bin->data;
-    d->len = bin->size;
-    d->i = 0;
+    d->p = NULL;
+    d->u = NULL;
+    d->len = -1;
+    d->i = -1;
 
     d->st_data = (char*) enif_alloc(STACK_SIZE_INC * sizeof(char));
     d->st_size = STACK_SIZE_INC;
@@ -87,11 +99,36 @@ dec_init(Decoder* d, ErlNifEnv* env, ERL_NIF_TERM arg, ErlNifBinary* bin)
 
     d->st_data[0] = st_value;
     d->st_top++;
+
+    return d;
 }
 
 void
-dec_destroy(Decoder* d)
+dec_init(Decoder* d, ErlNifEnv* env, ERL_NIF_TERM arg, ErlNifBinary* bin)
 {
+    d->env = env;
+    d->arg = arg;
+
+    d->p = (char*) bin->data;
+    d->u = bin->data;
+    d->len = bin->size;
+
+    // I'd like to be more forceful on this check so that when
+    // we run a second iteration of the decoder we are sure
+    // that we're using the same binary. Unfortunately, I don't
+    // think there's a value to base this assertion on.
+    if(d->i < 0) {
+        d->i = 0;
+    } else {
+        assert(d->i <= d->len && "mismatched binary lengths");
+    }
+}
+
+void
+dec_destroy(ErlNifEnv* env, void* obj)
+{
+    Decoder* d = (Decoder*) obj;
+
     if(d->st_data != NULL) {
         enif_free(d->st_data);
     }
@@ -575,11 +612,41 @@ parse:
 }
 
 ERL_NIF_TERM
-make_object(ErlNifEnv* env, ERL_NIF_TERM pairs)
+make_empty_object(ErlNifEnv* env, int ret_map)
 {
-    ERL_NIF_TERM ret = enif_make_list(env, 0);
-    ERL_NIF_TERM key, val;
+#if MAP_TYPE_PRESENT
+    if(ret_map) {
+        return enif_make_new_map(env);
+    }
+#endif
 
+    return enif_make_tuple1(env, enif_make_list(env, 0));
+}
+
+int
+make_object(ErlNifEnv* env, ERL_NIF_TERM pairs, ERL_NIF_TERM* out, int ret_map)
+{
+    ERL_NIF_TERM ret;
+    ERL_NIF_TERM key;
+    ERL_NIF_TERM val;
+
+#if MAP_TYPE_PRESENT
+    if(ret_map) {
+        ret = enif_make_new_map(env);
+        while(enif_get_list_cell(env, pairs, &val, &pairs)) {
+            if(!enif_get_list_cell(env, pairs, &key, &pairs)) {
+                assert(0 == 1 && "Unbalanced object pairs.");
+            }
+            if(!enif_make_map_put(env, ret, key, val, &ret)) {
+                return 0;
+            }
+        }
+        *out = ret;
+        return 1;
+    }
+#endif
+
+    ret = enif_make_list(env, 0);
     while(enif_get_list_cell(env, pairs, &val, &pairs)) {
         if(!enif_get_list_cell(env, pairs, &key, &pairs)) {
             assert(0 == 1 && "Unbalanced object pairs.");
@@ -587,8 +654,9 @@ make_object(ErlNifEnv* env, ERL_NIF_TERM pairs)
         val = enif_make_tuple2(env, key, val);
         ret = enif_make_list_cell(env, val, ret);
     }
+    *out = enif_make_tuple1(env, ret);
 
-    return enif_make_tuple1(env, ret);
+    return 1;
 }
 
 ERL_NIF_TERM
@@ -605,29 +673,109 @@ make_array(ErlNifEnv* env, ERL_NIF_TERM list)
 }
 
 ERL_NIF_TERM
-decode(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+decode_init(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
-    Decoder dec;
-    Decoder* d = &dec;
+    Decoder* d;
+    jiffy_st* st = (jiffy_st*) enif_priv_data(env);
+    ERL_NIF_TERM tmp_argv[5];
+    ERL_NIF_TERM opts;
+    ERL_NIF_TERM val;
+
+    if(argc != 2) {
+        return enif_make_badarg(env);
+    }
+
+    d = dec_new(env);
+    if(d == NULL) {
+        return make_error(st, env, "internal_error");
+    }
+
+    tmp_argv[0] = argv[0];
+    tmp_argv[1] = enif_make_resource(env, d);
+    tmp_argv[2] = st->atom_error;
+    tmp_argv[3] = enif_make_list(env, 0);
+    tmp_argv[4] = enif_make_list(env, 0);
+
+    enif_release_resource(d);
+
+    opts = argv[1];
+    if(!enif_is_list(env, opts)) {
+        return enif_make_badarg(env);
+    }
+
+    while(enif_get_list_cell(env, opts, &val, &opts)) {
+        if(get_bytes_per_iter(env, val, &(d->bytes_per_red))) {
+            continue;
+        } else if(get_bytes_per_red(env, val, &(d->bytes_per_red))) {
+            continue;
+        } else if(enif_compare(val, d->atoms->atom_return_maps) == 0) {
+#if MAP_TYPE_PRESENT
+            d->return_maps = 1;
+#else
+            return enif_make_badarg(env);
+#endif
+        } else if(enif_compare(val, d->atoms->atom_return_trailer) == 0) {
+            d->return_trailer = 1;
+        } else if(enif_compare(val, d->atoms->atom_use_nil) == 0) {
+            d->null_term = d->atoms->atom_nil;
+        } else if(get_null_term(env, val, &(d->null_term))) {
+            continue;
+        } else {
+            return enif_make_badarg(env);
+        }
+    }
+
+    return decode_iter(env, 5, tmp_argv);
+}
+
+ERL_NIF_TERM
+decode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+    Decoder* d;
+    jiffy_st* st = (jiffy_st*) enif_priv_data(env);
 
     ErlNifBinary bin;
 
-    ERL_NIF_TERM objs = enif_make_list(env, 0);
-    ERL_NIF_TERM curr = enif_make_list(env, 0);
-    ERL_NIF_TERM val;
+    ERL_NIF_TERM objs;
+    ERL_NIF_TERM curr;
+    ERL_NIF_TERM val = argv[2];
+    ERL_NIF_TERM trailer;
     ERL_NIF_TERM ret;
+    size_t bytes_read = 0;
 
-    if(argc != 1) {
+    if(argc != 5) {
         return enif_make_badarg(env);
     } else if(!enif_inspect_binary(env, argv[0], &bin)) {
+        return enif_make_badarg(env);
+    } else if(!enif_get_resource(env, argv[1], st->res_dec, (void**) &d)) {
+        return enif_make_badarg(env);
+    } else if(!enif_is_list(env, argv[3])) {
+        return enif_make_badarg(env);
+    } else if(!enif_is_list(env, argv[4])) {
         return enif_make_badarg(env);
     }
 
     dec_init(d, env, argv[0], &bin);
+    objs = argv[3];
+    curr = argv[4];
 
     //fprintf(stderr, "Parsing:\r\n");
     while(d->i < bin.size) {
         //fprintf(stderr, "state: %d\r\n", dec_curr(d));
+
+        if(should_yield(env, &bytes_read, d->bytes_per_red)) {
+            return enif_make_tuple5(
+                    env,
+                    st->atom_iter,
+                    argv[1],
+                    val,
+                    objs,
+                    curr
+                );
+        }
+
+        bytes_read += 1;
+
         switch(dec_curr(d)) {
             case st_value:
                 switch(d->p[d->i]) {
@@ -646,7 +794,7 @@ decode(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                             ret = dec_error(d, "invalid_literal");
                             goto done;
                         }
-                        val = d->atoms->atom_null;
+                        val = d->null_term;
                         dec_pop(d, st_value);
                         d->i += 4;
                         break;
@@ -770,7 +918,7 @@ decode(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                         dec_pop(d, st_key);
                         dec_pop(d, st_object);
                         dec_pop(d, st_value);
-                        val = enif_make_tuple1(env, curr);
+                        val = make_empty_object(env, d->return_maps);
                         if(!enif_get_list_cell(env, objs, &curr, &objs)) {
                             ret = dec_error(d, "internal_error");
                             goto done;
@@ -839,7 +987,10 @@ decode(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                         }
                         dec_pop(d, st_object);
                         dec_pop(d, st_value);
-                        val = make_object(env, curr);
+                        if(!make_object(env, curr, &val, d->return_maps)) {
+                            ret = dec_error(d, "internal_object_error");
+                            goto done;
+                        }
                         if(!enif_get_list_cell(env, objs, &curr, &objs)) {
                             ret = dec_error(d, "internal_error");
                             goto done;
@@ -888,8 +1039,7 @@ decode(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                         d->i++;
                         break;
                     default:
-                        ret = dec_error(d, "invalid_trailing_data");
-                        goto done;
+                        goto decode_done;
                 }
                 break;
 
@@ -897,6 +1047,16 @@ decode(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                 ret = dec_error(d, "invalid_internal_state");
                 goto done;
         }
+    }
+
+decode_done:
+
+    if(d->i < bin.size && d->return_trailer) {
+        trailer = enif_make_sub_binary(env, argv[0], d->i, bin.size - d->i);
+        val = enif_make_tuple3(env, d->atoms->atom_has_trailer, val, trailer);
+    } else if(d->i < bin.size) {
+        ret = dec_error(d, "invalid_trailing_data");
+        goto done;
     }
 
     if(dec_curr(d) != st_done) {
@@ -908,7 +1068,5 @@ decode(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     }
 
 done:
-    dec_destroy(d);
-
     return ret;
 }
