@@ -408,7 +408,7 @@ enc_long(Encoder* e, ErlNifSInt64 val)
     }
 
 #if (defined(__WIN32__) || defined(_WIN32) || defined(_WIN32_))
-    snprintf(&(e->p[e->i]), 32, "%ld", val);
+    snprintf(&(e->p[e->i]), 32, "%lld", val);
 #elif SIZEOF_LONG == 8
     snprintf(&(e->p[e->i]), 32, "%ld", val);
 #else
@@ -541,7 +541,6 @@ enc_map_to_ejson(ErlNifEnv* env, ERL_NIF_TERM map, ERL_NIF_TERM* out)
     ERL_NIF_TERM val;
 
     if(!enif_get_map_size(env, map, &size)) {
-        fprintf(stderr, "bad map size\r\n");
         return 0;
     }
 
@@ -553,18 +552,19 @@ enc_map_to_ejson(ErlNifEnv* env, ERL_NIF_TERM map, ERL_NIF_TERM* out)
     }
 
     if(!enif_map_iterator_create(env, map, &iter, ERL_NIF_MAP_ITERATOR_HEAD)) {
-        fprintf(stderr, "bad iterator create\r\n");
         return 0;
     }
 
     do {
         if(!enif_map_iterator_get_pair(env, &iter, &key, &val)) {
-            fprintf(stderr, "bad get pair\r\n");
+            enif_map_iterator_destroy(env, &iter);
             return 0;
         }
         tuple = enif_make_tuple2(env, key, val);
         list = enif_make_list_cell(env, tuple, list);
     } while(enif_map_iterator_next(env, &iter));
+
+    enif_map_iterator_destroy(env, &iter);
 
     *out = enif_make_tuple1(env, list);
     return 1;
