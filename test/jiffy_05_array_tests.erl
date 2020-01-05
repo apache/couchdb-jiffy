@@ -16,6 +16,16 @@ array_failure_test_() ->
     [gen(error, Case) || Case <- cases(error)].
 
 
+nested_array_test_() ->
+    Obj = nested(256),
+    Enc = enc(Obj),
+    ?_assertEqual(Obj, dec(Enc)).
+
+
+nested(0) -> <<"bottom">>;
+nested(N) -> [nested(N - 1)].
+
+
 gen(ok, {J, E}) ->
     gen(ok, {J, E, J});
 gen(ok, {J1, E, J2}) ->
@@ -26,7 +36,7 @@ gen(ok, {J1, E, J2}) ->
 
 gen(error, J) ->
     {msg("Error: ~s", [J]), [
-        ?_assertThrow({error, _}, dec(J))
+        ?_assertError(_, dec(J))
     ]}.
 
 

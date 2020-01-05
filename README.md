@@ -18,7 +18,7 @@ it returns a binary most of the time.
 A quick note on unicode. Jiffy only understands UTF-8 in binaries. End
 of story.
 
-Errors are raised as exceptions.
+Errors are raised as error exceptions.
 
     Eshell V5.8.2  (abort with ^G)
     1> jiffy:decode(<<"{\"foo\": \"bar\"}">>).
@@ -52,6 +52,13 @@ The options for decode are:
   will ensure that the parsed object only contains a single entry
   containing the last value seen. This mirrors the parsing beahvior
   of virtually every other JSON parser.
+* `copy_strings` - Normally, when strings are decoded, they are
+  created as sub-binaries of the input data. With some workloads, this
+  leads to an undesirable bloating of memory: Strings in the decode
+  result keep a reference to the full JSON document alive. Setting
+  this option will instead allocate new binaries for each string, so
+  the original JSON document can be garbage collected even though
+  the decode result is still in use.
 * `{bytes_per_red, N}` where N &gt;= 0 - This controls the number of
   bytes that Jiffy will process as an equivalent to a reduction. Each
   20 reductions we consume 1% of our allocated time slice for the current

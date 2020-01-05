@@ -54,10 +54,10 @@ typedef struct {
     int             return_maps;
     int             return_trailer;
     int             dedupe_keys;
+    int             copy_strings;
     ERL_NIF_TERM    null_term;
 
-    char*           p;
-    unsigned char*  u;
+    unsigned char*  p;
     int             i;
     int             len;
 
@@ -84,14 +84,14 @@ dec_new(ErlNifEnv* env)
     d->return_maps = 0;
     d->return_trailer = 0;
     d->dedupe_keys = 0;
+    d->copy_strings = 0;
     d->null_term = d->atoms->atom_null;
 
     d->p = NULL;
-    d->u = NULL;
     d->len = -1;
-    d->i = -1;
+    d->i = 0;
 
-    d->st_data = (char*) enif_alloc(STACK_SIZE_INC * sizeof(char));
+    d->st_data = (char*) enif_alloc(STACK_SIZE_INC);
     d->st_size = STACK_SIZE_INC;
     d->st_top = 0;
 
@@ -111,19 +111,8 @@ dec_init(Decoder* d, ErlNifEnv* env, ERL_NIF_TERM arg, ErlNifBinary* bin)
     d->env = env;
     d->arg = arg;
 
-    d->p = (char*) bin->data;
-    d->u = bin->data;
+    d->p = bin->data;
     d->len = bin->size;
-
-    // I'd like to be more forceful on this check so that when
-    // we run a second iteration of the decoder we are sure
-    // that we're using the same binary. Unfortunately, I don't
-    // think there's a value to base this assertion on.
-    if(d->i < 0) {
-        d->i = 0;
-    } else {
-        assert(d->i <= d->len && "mismatched binary lengths");
-    }
 }
 
 void
@@ -148,7 +137,8 @@ dec_error(Decoder* d, const char* atom)
 char
 dec_curr(Decoder* d)
 {
-    return d->st_data[d->st_top-1];
+    assert(d->st_top > 0);
+    return d->st_data[d->st_top - 1];
 }
 
 int
@@ -160,31 +150,41 @@ dec_top(Decoder* d)
 void
 dec_push(Decoder* d, char val)
 {
-    char* tmp;
     int new_sz;
     int i;
 
-    if(d->st_top >= d->st_size) {
+    if(d->st_top == d->st_size) {
         new_sz = d->st_size + STACK_SIZE_INC;
-        tmp = (char*) enif_alloc(new_sz * sizeof(char));
-        memcpy(tmp, d->st_data, d->st_size * sizeof(char));
-        enif_free(d->st_data);
-        d->st_data = tmp;
+        d->st_data = (char*) enif_realloc(d->st_data, new_sz);
         d->st_size = new_sz;
         for(i = d->st_top; i < d->st_size; i++) {
             d->st_data[i] = st_invalid;
         }
     }
 
+    assert(d->st_top < d->st_size);
     d->st_data[d->st_top++] = val;
 }
 
+char
+dec_pop(Decoder* d) {
+    char current = st_invalid;
+
+    if (d->st_top > 0) {
+        current = d->st_data[d->st_top - 1];
+        d->st_data[d->st_top - 1] = st_invalid;
+        d->st_top--;
+    }
+
+    return current;
+}
+
 void
-dec_pop(Decoder* d, char val)
+dec_pop_assert(Decoder* d, char val)
 {
-    assert(d->st_data[d->st_top-1] == val && "popped invalid state.");
-    d->st_data[d->st_top-1] = st_invalid;
-    d->st_top--;
+    char current = dec_pop(d);
+    assert(current == val && "popped invalid state.");
+    (void)current;
 }
 
 int
@@ -208,7 +208,7 @@ dec_string(Decoder* d, ERL_NIF_TERM* value)
     st = d->i;
 
     while(d->i < d->len) {
-        if(d->u[d->i] < 0x20) {
+        if(d->p[d->i] < 0x20) {
             return 0;
         } else if(d->p[d->i] == '\"') {
             d->i++;
@@ -238,7 +238,7 @@ dec_string(Decoder* d, ERL_NIF_TERM* value)
                     if(d->i + 4 >= d->len) {
                         return 0;
                     }
-                    hi = int_from_hex(&(d->u[d->i]));
+                    hi = int_from_hex(&(d->p[d->i]));
                     if(hi < 0) {
                         return 0;
                     }
@@ -252,7 +252,7 @@ dec_string(Decoder* d, ERL_NIF_TERM* value)
                         } else if(d->p[d->i++] != 'u') {
                             return 0;
                         }
-                        lo = int_from_hex(&(d->u[d->i]));
+                        lo = int_from_hex(&(d->p[d->i]));
                         if(lo < 0) {
                             return 0;
                         }
@@ -274,10 +274,10 @@ dec_string(Decoder* d, ERL_NIF_TERM* value)
                 default:
                     return 0;
             }
-        } else if(d->u[d->i] < 0x80) {
+        } else if(d->p[d->i] < 0x80) {
             d->i++;
         } else {
-            ulen = utf8_validate(&(d->u[d->i]), d->len - d->i);
+            ulen = utf8_validate(&(d->p[d->i]), d->len - d->i);
             if(ulen < 0) {
                 return 0;
             }
@@ -291,8 +291,13 @@ dec_string(Decoder* d, ERL_NIF_TERM* value)
     return 0;
 
 parse:
-    if(!has_escape) {
+    if(!has_escape && !d->copy_strings) {
         *value = enif_make_sub_binary(d->env, d->arg, st, (d->i - st - 1));
+        return 1;
+    } else if(!has_escape) {
+        ulen = d->i - 1 - st;
+        chrbuf = (char*) enif_make_new_binary(d->env, ulen, value),
+        memcpy(chrbuf, &(d->p[st]), ulen);
         return 1;
     }
 
@@ -338,12 +343,12 @@ parse:
                 break;
             case 'u':
                 ui++;
-                hi = int_from_hex(&(d->u[ui]));
+                hi = int_from_hex(&(d->p[ui]));
                 if(hi < 0) {
                     return 0;
                 }
                 if(hi >= 0xD800 && hi < 0xDC00) {
-                    lo = int_from_hex(&(d->u[ui+6]));
+                    lo = int_from_hex(&(d->p[ui+6]));
                     if(lo < 0) {
                         return 0;
                     }
@@ -674,17 +679,19 @@ decode_init(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
             continue;
         } else if(get_bytes_per_red(env, val, &(d->bytes_per_red))) {
             continue;
-        } else if(enif_compare(val, d->atoms->atom_return_maps) == 0) {
+        } else if(enif_is_identical(val, d->atoms->atom_return_maps)) {
 #if MAP_TYPE_PRESENT
             d->return_maps = 1;
 #else
             return enif_make_badarg(env);
 #endif
-        } else if(enif_compare(val, d->atoms->atom_return_trailer) == 0) {
+        } else if(enif_is_identical(val, d->atoms->atom_return_trailer)) {
             d->return_trailer = 1;
-        } else if(enif_compare(val, d->atoms->atom_dedupe_keys) == 0) {
+        } else if(enif_is_identical(val, d->atoms->atom_dedupe_keys)) {
             d->dedupe_keys = 1;
-        } else if(enif_compare(val, d->atoms->atom_use_nil) == 0) {
+        } else if(enif_is_identical(val, d->atoms->atom_copy_strings)) {
+            d->copy_strings = 1;
+        } else if(enif_is_identical(val, d->atoms->atom_use_nil)) {
             d->null_term = d->atoms->atom_nil;
         } else if(get_null_term(env, val, &(d->null_term))) {
             continue;
@@ -709,37 +716,59 @@ decode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     ERL_NIF_TERM val = argv[2];
     ERL_NIF_TERM trailer;
     ERL_NIF_TERM ret;
-    size_t bytes_read = 0;
+    ERL_NIF_TERM tmp_argv[5];
 
-    if(argc != 5) {
+    void* res;
+
+    size_t start;
+    size_t bytes_processed = 0;
+
+    if(!enif_inspect_binary(env, argv[0], &bin)) {
         return enif_make_badarg(env);
-    } else if(!enif_inspect_binary(env, argv[0], &bin)) {
-        return enif_make_badarg(env);
-    } else if(!enif_get_resource(env, argv[1], st->res_dec, (void**) &d)) {
-        return enif_make_badarg(env);
-    } else if(!enif_is_list(env, argv[3])) {
-        return enif_make_badarg(env);
-    } else if(!enif_is_list(env, argv[4])) {
+    } else if(!enif_get_resource(env, argv[1], st->res_dec, &res)) {
         return enif_make_badarg(env);
     }
+
+    d = (Decoder*) res;
 
     dec_init(d, env, argv[0], &bin);
     objs = argv[3];
     curr = argv[4];
 
+    start = d->i;
+
     while(d->i < bin.size) {
-        if(should_yield(env, &bytes_read, d->bytes_per_red)) {
-            return enif_make_tuple5(
+        bytes_processed = d->i - start;
+
+        if(should_yield(bytes_processed, d->bytes_per_red)) {
+            assert(enif_is_list(env, objs));
+            assert(enif_is_list(env, curr));
+
+            tmp_argv[0] = argv[0];
+            tmp_argv[1] = argv[1];
+            tmp_argv[2] = val;
+            tmp_argv[3] = objs;
+            tmp_argv[4] = curr;
+
+            bump_used_reds(env, bytes_processed, d->bytes_per_red);
+
+#if SCHEDULE_NIF_PRESENT
+            return enif_schedule_nif(
+                    env,
+                    "nif_decode_iter",
+                    0,
+                    decode_iter,
+                    5,
+                    tmp_argv
+                );
+#else
+            return enif_make_tuple2(
                     env,
                     st->atom_iter,
-                    argv[1],
-                    val,
-                    objs,
-                    curr
+                    enif_make_tuple_from_array(env, tmp_argv, 5)
                 );
+#endif
         }
-
-        bytes_read += 1;
 
         switch(dec_curr(d)) {
             case st_value:
@@ -760,7 +789,7 @@ decode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                             goto done;
                         }
                         val = d->null_term;
-                        dec_pop(d, st_value);
+                        dec_pop_assert(d, st_value);
                         d->i += 4;
                         break;
                     case 't':
@@ -773,7 +802,7 @@ decode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                             goto done;
                         }
                         val = d->atoms->atom_true;
-                        dec_pop(d, st_value);
+                        dec_pop_assert(d, st_value);
                         d->i += 4;
                         break;
                     case 'f':
@@ -786,7 +815,7 @@ decode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                             goto done;
                         }
                         val = d->atoms->atom_false;
-                        dec_pop(d, st_value);
+                        dec_pop_assert(d, st_value);
                         d->i += 5;
                         break;
                     case '\"':
@@ -794,7 +823,7 @@ decode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                             ret = dec_error(d, "invalid_string");
                             goto done;
                         }
-                        dec_pop(d, st_value);
+                        dec_pop_assert(d, st_value);
                         break;
                     case '-':
                     case '0':
@@ -811,7 +840,7 @@ decode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                             ret = dec_error(d, "invalid_number");
                             goto done;
                         }
-                        dec_pop(d, st_value);
+                        dec_pop_assert(d, st_value);
                         break;
                     case '{':
                         dec_push(d, st_object);
@@ -832,13 +861,12 @@ decode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                             ret = dec_error(d, "invalid_json");
                             goto done;
                         }
-                        dec_pop(d, st_value);
-                        if(dec_curr(d) != st_array) {
+                        dec_pop_assert(d, st_value);
+                        if(dec_pop(d) != st_array) {
                             ret = dec_error(d, "invalid_json");
                             goto done;
                         }
-                        dec_pop(d, st_array);
-                        dec_pop(d, st_value);
+                        dec_pop_assert(d, st_value);
                         val = curr; // curr is []
                         if(!enif_get_list_cell(env, objs, &curr, &objs)) {
                             ret = dec_error(d, "internal_error");
@@ -871,7 +899,7 @@ decode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                             ret = dec_error(d, "invalid_string");
                             goto done;
                         }
-                        dec_pop(d, st_key);
+                        dec_pop_assert(d, st_key);
                         dec_push(d, st_colon);
                         curr = enif_make_list_cell(env, val, curr);
                         break;
@@ -880,9 +908,9 @@ decode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                             ret = dec_error(d, "invalid_json");
                             goto done;
                         }
-                        dec_pop(d, st_key);
-                        dec_pop(d, st_object);
-                        dec_pop(d, st_value);
+                        dec_pop_assert(d, st_key);
+                        dec_pop_assert(d, st_object);
+                        dec_pop_assert(d, st_value);
                         val = make_empty_object(env, d->return_maps);
                         if(!enif_get_list_cell(env, objs, &curr, &objs)) {
                             ret = dec_error(d, "internal_error");
@@ -911,7 +939,7 @@ decode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                         d->i++;
                         break;
                     case ':':
-                        dec_pop(d, st_colon);
+                        dec_pop_assert(d, st_colon);
                         dec_push(d, st_value);
                         d->i++;
                         break;
@@ -930,7 +958,7 @@ decode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                         d->i++;
                         break;
                     case ',':
-                        dec_pop(d, st_comma);
+                        dec_pop_assert(d, st_comma);
                         switch(dec_curr(d)) {
                             case st_object:
                                 dec_push(d, st_key);
@@ -945,13 +973,12 @@ decode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                         d->i++;
                         break;
                     case '}':
-                        dec_pop(d, st_comma);
-                        if(dec_curr(d) != st_object) {
+                        dec_pop_assert(d, st_comma);
+                        if(dec_pop(d) != st_object) {
                             ret = dec_error(d, "invalid_json");
                             goto done;
                         }
-                        dec_pop(d, st_object);
-                        dec_pop(d, st_value);
+                        dec_pop_assert(d, st_value);
                         if(!make_object(env, curr, &val,
                                 d->return_maps, d->dedupe_keys)) {
                             ret = dec_error(d, "internal_object_error");
@@ -970,13 +997,12 @@ decode_iter(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                         d->i++;
                         break;
                     case ']':
-                        dec_pop(d, st_comma);
-                        if(dec_curr(d) != st_array) {
+                        dec_pop_assert(d, st_comma);
+                        if(dec_pop(d) != st_array) {
                             ret = dec_error(d, "invalid_json");
                             goto done;
                         }
-                        dec_pop(d, st_array);
-                        dec_pop(d, st_value);
+                        dec_pop_assert(d, st_value);
                         val = make_array(env, curr);
                         if(!enif_get_list_cell(env, objs, &curr, &objs)) {
                             ret = dec_error(d, "internal_error");
@@ -1025,7 +1051,7 @@ decode_done:
         goto done;
     }
 
-    if(dec_curr(d) != st_done) {
+    if(dec_pop(d) != st_done) {
         ret = dec_error(d, "truncated_json");
     } else if(d->is_partial) {
         ret = enif_make_tuple2(env, d->atoms->atom_partial, val);
@@ -1034,5 +1060,7 @@ decode_done:
     }
 
 done:
+    bump_used_reds(env, bytes_processed, d->bytes_per_red);
+
     return ret;
 }

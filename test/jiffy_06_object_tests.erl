@@ -16,6 +16,20 @@ object_failure_test_() ->
     [gen(error, Case) || Case <- cases(error)].
 
 
+nested_object_test_() ->
+    Obj = nested(256),
+    Enc = enc(Obj),
+    ?_assertEqual(Obj, dec(Enc)).
+
+
+nested(0) -> <<"bottom">>;
+nested(N) -> {[{to_bin(N), nested(N - 1)}]}.
+
+
+to_bin(N) when is_integer(N) ->
+    list_to_binary(integer_to_list(N)).
+
+
 gen(ok, {J, E}) ->
     gen(ok, {J, E, J});
 gen(ok, {J1, E, J2}) ->
@@ -26,7 +40,7 @@ gen(ok, {J1, E, J2}) ->
 
 gen(error, J) ->
     {msg("Error: ~s", [J]), [
-        ?_assertThrow({error, _}, dec(J))
+        ?_assertError(_, dec(J))
     ]}.
 
 
