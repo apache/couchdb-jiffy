@@ -1,4 +1,4 @@
-REBAR?=rebar
+REBAR?=$(shell echo `pwd`/bin/rebar)
 
 
 all: build
@@ -16,6 +16,7 @@ distclean: clean
 
 
 build:
+	./configure
 	$(REBAR) compile
 
 
